@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+import argparse
+import sqlite3
+import statistics
+import sys
+
+from dataclasses import dataclass
+from datetime import timezone, timedelta, datetime
+from contextlib import contextmanager
+from typing import Iterator
+
+
+@dataclass(frozen=True)
+class Group:
+    label: str
+    points: int
+    days: int
+
+
+@dataclass(frozen=True)
+class Sprint:
+    date: datetime
+    groups: list[Group]
+
+
+class SprintAlreadyExists(Exception):
+    pass
+
+
+def calculate_groups_ratio(sprint: Sprint) -> dict[str, float]:
+    return {group.label: group.points / group.days for group in sprint.groups}
+
+
+def calculate_sprints_ratio(sprints: list[Sprint]) -> dict[str, float]:
+    all_ratios: dict[str, list[float]] = {}
+    group_ratios = [calculate_groups_ratio(sprint) for sprint in sprints]
+    for group in group_ratios:
+        for label, ratio in group.items():
+            all_ratios.setdefault(label, []).append(ratio)
+    return {label: statistics.fmean(ratios) for label, ratios in all_ratios.items()}
+
+
+def calculate_expected_points(
+    ratio: dict[str, float], group_days: dict[str, int]
+) -> dict[str, int]:
+    return {
+        label: int(ratio.get(label, 0) * days) for label, days in group_days.items()
+    }
+
+
+def get_weeknum_datetime(year: int, weeknum: int) -> datetime:
+    return datetime.strptime(f"{year}-W{weeknum}-1", "%Y-W%W-%w").replace(
+        tzinfo=timezone.utc
+    )
+
+
+def get_group_name(name: str) -> str:
+    return name.lower().replace(" ", "_").replace("-", "_")
+
+
+class SprintGW:
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self.connection = connection
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS "sprint" (
+                "id" INTEGER NOT NULL,
+                "date" INTEGER NOT NULL UNIQUE,
+                PRIMARY KEY("id")
+            )"""
+        )
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS "group" (
+                "sprint_id" INTEGER NOT NULL,
+                "label" TEXT NOT NULL,
+                "points" INTEGER NOT NULL,
+                "days" INTEGER NOT NULL,
+                FOREIGN KEY(sprint_id) REFERENCES sprint(id) ON DELETE CASCADE
+            )"""
+        )
+
+    def add_sprint(self, sprint: Sprint) -> None:
+        try:
+            row = self.connection.execute(
+                "INSERT INTO sprint (date) VALUES (?) RETURNING id",
+                (int(sprint.date.timestamp()),),
+            ).fetchone()
+            self.connection.executemany(
+                'INSERT INTO "group" (sprint_id, label, points, days) VALUES (?, ?, ?, ?)',
+                [
+                    (row[0], group.label, group.points, group.days)
+                    for group in sprint.groups
+                ],
+            )
+        except sqlite3.IntegrityError as err:
+            raise SprintAlreadyExists() from err
+
+    def get_sprints(self, range: tuple[datetime, datetime]) -> list[Sprint]:
+        sql_sprints: dict[int, list] = {}
+        sql_items = self.connection.execute(
+            """
+            SELECT * FROM "group"
+            JOIN sprint ON sprint.id = "group".sprint_id
+            WHERE sprint.date >= ? AND sprint.date <= ?
+            """,
+            tuple(map(lambda x: int(x.timestamp()), range)),
+        ).fetchall()
+        for sql_item in sql_items:
+            sql_sprints.setdefault(sql_item["date"], [])
+            sql_sprints[sql_item["date"]].append(sql_item)
+        return [
+            Sprint(
+                date=datetime.fromtimestamp(timestamp),
+                groups=[
+                    Group(
+                        label=sql_item["label"],
+                        points=sql_item["points"],
+                        days=sql_item["days"],
+                    )
+                    for sql_item in sql_items
+                ],
+            )
+            for timestamp, sql_items in sql_sprints.items()
+        ]
+
+    def delete_sprint(self, date: datetime) -> None:
+        self.connection.execute(
+            "DELETE FROM sprint WHERE date = ?", (int(date.timestamp()),)
+        )
+
+
+class Database:
+    def __init__(self, filename: str) -> None:
+        self.filename = filename
+
+    @contextmanager
+    def create_session(self) -> Iterator[SprintGW]:
+        connection = sqlite3.connect(self.filename)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = 1")
+        try:
+            yield SprintGW(connection)
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def get_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action", choices=COMMAND_MAPPING.keys())
+    parser.add_argument("weeknum", type=int)
+    parser.add_argument("-w", "--weeks", type=int, default=0)
+    parser.add_argument("-g", "--group", action="append", nargs="*", default=[])
+    parser.add_argument("-d", "--dbpath", default="velocity.db")
+    return parser.parse_args()
+
+
+def create_velocity(args: argparse.Namespace) -> bool:
+    date = get_weeknum_datetime(datetime.now(tz=timezone.utc).year, args.weeknum)
+    sprint = Sprint(
+        date=date,
+        groups=[
+            Group(
+                label=get_group_name(group[0]),
+                days=int(group[1]),
+                points=sum(map(lambda x: int(x), group[2:])),
+            )
+            for group in args.group
+        ],
+    )
+    with Database(args.dbpath).create_session() as session:
+        try:
+            session.add_sprint(sprint)
+            print(f"* Created 1 sprint for week {args.weeknum}", file=sys.stderr)
+            return True
+        except SprintAlreadyExists:
+            print(f"* Sprint for week {args.weeknum} already exists", file=sys.stderr)
+            return False
+
+
+def get_velocity(args: argparse.Namespace) -> bool:
+    start = get_weeknum_datetime(datetime.now(tz=timezone.utc).year, args.weeknum)
+    finish = start - timedelta(weeks=args.weeks)
+    with Database(args.dbpath).create_session() as session:
+        sprints = session.get_sprints((finish, start))
+        if not sprints:
+            print(
+                f"* No sprint found starting from week {args.weeknum} "
+                f"({finish.date()} to {start.date()})",
+                file=sys.stderr,
+            )
+            return False
+
+        print(
+            f"* Retrieved {len(sprints)} sprint(s) starting from week {args.weeknum} "
+            f"({finish.date()} to {start.date()})",
+            file=sys.stderr,
+        )
+        ratio = calculate_sprints_ratio(sprints)
+        points = calculate_expected_points(
+            ratio, {get_group_name(group[0]): int(group[1]) for group in args.group}
+        )
+        total = 0
+        for label, point in points.items():
+            print(f"{label} {point} {ratio.get(label, '?')}")
+            total += point
+        print(f"= {total}")
+        return True
+
+
+def delete_velocity(args: argparse.Namespace) -> bool:
+    date = get_weeknum_datetime(datetime.now(tz=timezone.utc).year, args.weeknum)
+    with Database(args.dbpath).create_session() as session:
+        session.delete_sprint(date)
+        return True
+
+
+COMMAND_MAPPING = {
+    "create": create_velocity,
+    "get": get_velocity,
+    "delete": delete_velocity,
+}
+
+
+if __name__ == "__main__":
+    try:
+        args = get_args()
+        if not COMMAND_MAPPING[args.action](args):
+            sys.exit(1)
+    except Exception as err:
+        print(f"Unexpected error ({err.__class__.__name__}) {err}", file=sys.stderr)
+        sys.exit(1)
